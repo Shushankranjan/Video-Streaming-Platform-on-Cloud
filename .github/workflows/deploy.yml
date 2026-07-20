@@ -1,0 +1,122 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+jobs:
+  # ── Build & Push Docker Images ─────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Images to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push API image
+        run: |
+          IMAGE=${{ steps.ecr-login.outputs.registry }}/vsp/api:${{ steps.meta.outputs.tag }}
+          docker build -f apps/api/Dockerfile -t $IMAGE apps/api
+          docker push $IMAGE
+          docker tag $IMAGE ${{ steps.ecr-login.outputs.registry }}/vsp/api:latest
+          docker push ${{ steps.ecr-login.outputs.registry }}/vsp/api:latest
+
+      - name: Build & push FFmpeg Worker image
+        run: |
+          IMAGE=${{ steps.ecr-login.outputs.registry }}/vsp/worker:${{ steps.meta.outputs.tag }}
+          docker build -f apps/api/Dockerfile.worker -t $IMAGE apps/api
+          docker push $IMAGE
+          docker tag $IMAGE ${{ steps.ecr-login.outputs.registry }}/vsp/worker:latest
+          docker push ${{ steps.ecr-login.outputs.registry }}/vsp/worker:latest
+
+      - name: Build & push Web image
+        run: |
+          IMAGE=${{ steps.ecr-login.outputs.registry }}/vsp/web:${{ steps.meta.outputs.tag }}
+          docker build -f apps/web/Dockerfile -t $IMAGE apps/web
+          docker push $IMAGE
+          docker tag $IMAGE ${{ steps.ecr-login.outputs.registry }}/vsp/web:latest
+          docker push ${{ steps.ecr-login.outputs.registry }}/vsp/web:latest
+
+  # ── CDK Deploy ────────────────────────────────────────────────────────────
+  cdk-deploy:
+    name: CDK Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK dependencies
+        working-directory: infra
+        run: npm ci
+
+      - name: CDK Diff (informational)
+        working-directory: infra
+        run: npx cdk diff --all || true
+
+      - name: CDK Deploy
+        working-directory: infra
+        run: npx cdk deploy --all --require-approval never
+
+  # ── Force ECS Re-deployment ────────────────────────────────────────────────
+  ecs-redeploy:
+    name: Force ECS Service Update
+    runs-on: ubuntu-latest
+    needs: [build-and-push, cdk-deploy]
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new API deployment
+        run: |
+          aws ecs update-service \
+            --cluster vsp-cluster \
+            --service VspEcsStack-ApiService \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Force new Worker deployment
+        run: |
+          aws ecs update-service \
+            --cluster vsp-cluster \
+            --service VspEcsStack-WorkerService \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}

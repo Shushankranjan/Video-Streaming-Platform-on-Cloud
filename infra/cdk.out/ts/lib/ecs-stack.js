@@ -1,0 +1,178 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.EcsStack = void 0;
+const cdk = __importStar(require("aws-cdk-lib"));
+const ec2 = __importStar(require("aws-cdk-lib/aws-ec2"));
+const ecs = __importStar(require("aws-cdk-lib/aws-ecs"));
+const elbv2 = __importStar(require("aws-cdk-lib/aws-elasticloadbalancingv2"));
+const iam = __importStar(require("aws-cdk-lib/aws-iam"));
+const logs = __importStar(require("aws-cdk-lib/aws-logs"));
+const appscaling = __importStar(require("aws-cdk-lib/aws-applicationautoscaling"));
+class EcsStack extends cdk.Stack {
+    constructor(scope, id, props) {
+        super(scope, id, props);
+        // ── ECS Cluster ──────────────────────────────────────────────────────────
+        this.cluster = new ecs.Cluster(this, 'VspCluster', {
+            vpc: props.vpc,
+            clusterName: 'vsp-cluster',
+            containerInsights: true,
+        });
+        // ── IAM Task Role (shared by API + worker) ────────────────────────────────
+        const taskRole = new iam.Role(this, 'EcsTaskRole', {
+            assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+        });
+        props.storage.ingressBucket.grantReadWrite(taskRole);
+        props.storage.outputBucket.grantReadWrite(taskRole);
+        props.queue.transcodeQueue.grantConsumeMessages(taskRole);
+        props.queue.transcodeQueue.grantSendMessages(taskRole);
+        props.database.cluster.secret.grantRead(taskRole);
+        // ── CloudWatch Log Groups ─────────────────────────────────────────────────
+        const apiLogGroup = new logs.LogGroup(this, 'ApiLogGroup', {
+            logGroupName: '/vsp/api',
+            retention: logs.RetentionDays.TWO_WEEKS,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
+        const workerLogGroup = new logs.LogGroup(this, 'WorkerLogGroup', {
+            logGroupName: '/vsp/worker',
+            retention: logs.RetentionDays.TWO_WEEKS,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
+        // ── ALB ───────────────────────────────────────────────────────────────────
+        this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
+            vpc: props.vpc,
+            internetFacing: true,
+        });
+        // ── API Fargate Service ───────────────────────────────────────────────────
+        const apiTaskDef = new ecs.FargateTaskDefinition(this, 'ApiTaskDef', {
+            cpu: 512,
+            memoryLimitMiB: 1024,
+            taskRole,
+        });
+        const apiContainer = apiTaskDef.addContainer('ApiContainer', {
+            image: ecs.ContainerImage.fromEcrRepository(props.apiRepo, 'latest'),
+            logging: ecs.LogDrivers.awsLogs({ logGroup: apiLogGroup, streamPrefix: 'api' }),
+            environment: {
+                NODE_ENV: 'production',
+                USE_LOCAL_STORAGE: 'false',
+                USE_SQS: 'true',
+                USE_COGNITO: 'true',
+                S3_REGION: this.region,
+                S3_INGRESS_BUCKET: props.storage.ingressBucket.bucketName,
+                S3_OUTPUT_BUCKET: props.storage.outputBucket.bucketName,
+                SQS_QUEUE_URL: props.queue.transcodeQueue.queueUrl,
+                COGNITO_REGION: this.region,
+                COGNITO_USER_POOL_ID: props.auth.userPool.userPoolId,
+                COGNITO_CLIENT_ID: props.auth.userPoolClient.userPoolClientId,
+                REDIS_URL: props.cache.redisEndpoint,
+                PORT: '3001',
+            },
+            secrets: {
+                // DATABASE_URL is injected from Secrets Manager at container start
+                DATABASE_URL: ecs.Secret.fromSecretsManager(props.database.cluster.secret, 'dbURL'),
+            },
+            portMappings: [{ containerPort: 3001 }],
+        });
+        const apiService = new ecs.FargateService(this, 'ApiService', {
+            cluster: this.cluster,
+            taskDefinition: apiTaskDef,
+            desiredCount: 2,
+            vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        });
+        // Allow ALB to reach the API on port 3001
+        const apiSg = apiService.connections.securityGroups[0];
+        apiSg.addIngressRule(ec2.Peer.ipv4(props.vpc.vpcCidrBlock), ec2.Port.tcp(3001));
+        // Allow API to reach RDS
+        props.database.dbSg.addIngressRule(apiSg, ec2.Port.tcp(5432));
+        // Allow API to reach Redis
+        props.cache.redisSg.addIngressRule(apiSg, ec2.Port.tcp(6379));
+        // ALB listener → target group → API service
+        const listener = this.alb.addListener('HttpListener', { port: 80 });
+        listener.addTargets('ApiTarget', {
+            port: 3001,
+            protocol: elbv2.ApplicationProtocol.HTTP,
+            targets: [apiService],
+            healthCheck: { path: '/health', interval: cdk.Duration.seconds(30) },
+        });
+        // ── FFmpeg Worker Fargate Service ─────────────────────────────────────────
+        const workerTaskDef = new ecs.FargateTaskDefinition(this, 'WorkerTaskDef', {
+            cpu: 2048, // transcoding is CPU-intensive
+            memoryLimitMiB: 4096,
+            taskRole,
+        });
+        workerTaskDef.addContainer('WorkerContainer', {
+            image: ecs.ContainerImage.fromEcrRepository(props.workerRepo, 'latest'),
+            logging: ecs.LogDrivers.awsLogs({ logGroup: workerLogGroup, streamPrefix: 'worker' }),
+            environment: {
+                NODE_ENV: 'production',
+                USE_LOCAL_STORAGE: 'false',
+                USE_SQS: 'true',
+                S3_REGION: this.region,
+                S3_INGRESS_BUCKET: props.storage.ingressBucket.bucketName,
+                S3_OUTPUT_BUCKET: props.storage.outputBucket.bucketName,
+                SQS_QUEUE_URL: props.queue.transcodeQueue.queueUrl,
+                SQS_REGION: this.region,
+                // API base URL so the worker can call the webhook
+                API_BASE_URL: `http://${this.alb.loadBalancerDnsName}`,
+            },
+            secrets: {
+                DATABASE_URL: ecs.Secret.fromSecretsManager(props.database.cluster.secret, 'dbURL'),
+            },
+        });
+        const workerService = new ecs.FargateService(this, 'WorkerService', {
+            cluster: this.cluster,
+            taskDefinition: workerTaskDef,
+            desiredCount: 1,
+            vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        });
+        // Auto-scale worker based on SQS queue depth
+        const scaling = workerService.autoScaleTaskCount({ minCapacity: 0, maxCapacity: 10 });
+        scaling.scaleOnMetric('SqsScaling', {
+            metric: props.queue.transcodeQueue.metricApproximateNumberOfMessagesVisible(),
+            scalingSteps: [
+                { upper: 0, change: -1 },
+                { lower: 1, change: +1 },
+                { lower: 5, change: +3 },
+            ],
+            adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+        });
+        // Allow worker to reach RDS + Redis
+        props.database.dbSg.addIngressRule(workerService.connections.securityGroups[0], ec2.Port.tcp(5432));
+        props.cache.redisSg.addIngressRule(workerService.connections.securityGroups[0], ec2.Port.tcp(6379));
+        new cdk.CfnOutput(this, 'AlbDnsName', { value: this.alb.loadBalancerDnsName });
+    }
+}
+exports.EcsStack = EcsStack;
+//# sourceMappingURL=ecs-stack.js.map

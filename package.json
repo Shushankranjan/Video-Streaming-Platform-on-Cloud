@@ -1,0 +1,21 @@
+{
+  "name": "video-streaming-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/api & npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=apps/api && npm run build --workspace=apps/web",
+    "db:up": "docker compose up -d postgres redis minio",
+    "db:migrate": "npm run migrate --workspace=apps/api",
+    "db:seed": "npm run seed --workspace=apps/api",
+    "worker": "npm run worker --workspace=apps/api"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.5"
+  }
+}

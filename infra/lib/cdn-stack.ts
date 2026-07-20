@@ -2,12 +2,10 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
-import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Construct } from 'constructs';
 
 interface CdnStackProps extends cdk.StackProps {
   outputBucket: s3.Bucket;
-  alb: elbv2.ApplicationLoadBalancer;
 }
 
 export class CdnStack extends cdk.Stack {
@@ -25,32 +23,23 @@ export class CdnStack extends cdk.Stack {
       originAccessControl: oac,
     });
 
+    // CloudFront distribution — serves HLS manifests and segments from S3.
+    // API traffic hits the ALB directly; the frontend uses NEXT_PUBLIC_API_URL to reach it.
     this.distribution = new cloudfront.Distribution(this, 'VspDistribution', {
-      comment: 'VSP — HLS delivery + API proxy',
+      comment: 'VSP — HLS delivery from S3',
       defaultBehavior: {
-        // Default: proxy to the API (ALB)
-        origin: new origins.LoadBalancerV2Origin(props.alb, {
-          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
-        }),
+        origin: s3Origin,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,   // API responses must not be cached
-        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
-        originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER,
+        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+        // Signed URLs enforced via trusted key groups — add your key group here
+        trustedKeyGroups: [],
       },
-      additionalBehaviors: {
-        // HLS manifests and segments — serve from S3 via OAC
-        'videos/*': {
-          origin: s3Origin,
-          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-          cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-          // Signed URLs are enforced via trusted key groups (configure below)
-          trustedKeyGroups: [],  // TODO: add key group with your CloudFront public key
-        },
-      },
-      priceClass: cloudfront.PriceClass.PRICE_CLASS_100,  // US, Canada, Europe
+      priceClass: cloudfront.PriceClass.PRICE_CLASS_100, // US, Canada, Europe
     });
 
-    // Grant CloudFront OAC read access to the output S3 bucket
+    // Grant CloudFront OAC permission to read from the output bucket.
+    // Using CfnBucketPolicy (L1) here so the resource lives in CdnStack and
+    // does not write back into StorageStack, avoiding a circular dependency.
     new s3.CfnBucketPolicy(this, 'OutputBucketPolicy', {
       bucket: props.outputBucket.bucketName,
       policyDocument: {
@@ -60,7 +49,7 @@ export class CdnStack extends cdk.Stack {
             Effect: 'Allow',
             Action: 's3:GetObject',
             Principal: { Service: 'cloudfront.amazonaws.com' },
-            Resource: props.outputBucket.arnForObjects('*'),
+            Resource: `arn:aws:s3:::${props.outputBucket.bucketName}/*`,
             Condition: {
               StringEquals: {
                 'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,

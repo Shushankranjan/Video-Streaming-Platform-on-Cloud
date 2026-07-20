@@ -9,7 +9,7 @@ import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
 import { Construct } from 'constructs';
 import { DatabaseStack } from './database-stack';
 import { CacheStack } from './cache-stack';
-import { StorageStack } from './storage-stack';
+import { StorageCdnStack } from './storage-cdn-stack';
 import { QueueStack } from './queue-stack';
 import { AuthStack } from './auth-stack';
 
@@ -19,7 +19,7 @@ interface EcsStackProps extends cdk.StackProps {
   workerRepo: ecr.Repository;
   database: DatabaseStack;
   cache: CacheStack;
-  storage: StorageStack;
+  storage: StorageCdnStack;
   queue: QueueStack;
   auth: AuthStack;
 }

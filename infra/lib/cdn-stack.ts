@@ -51,18 +51,25 @@ export class CdnStack extends cdk.Stack {
     });
 
     // Grant CloudFront OAC read access to the output S3 bucket
-    props.outputBucket.addToResourcePolicy(
-      new cdk.aws_iam.PolicyStatement({
-        actions: ['s3:GetObject'],
-        principals: [new cdk.aws_iam.ServicePrincipal('cloudfront.amazonaws.com')],
-        resources: [props.outputBucket.arnForObjects('*')],
-        conditions: {
-          StringEquals: {
-            'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
+    new s3.CfnBucketPolicy(this, 'OutputBucketPolicy', {
+      bucket: props.outputBucket.bucketName,
+      policyDocument: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Action: 's3:GetObject',
+            Principal: { Service: 'cloudfront.amazonaws.com' },
+            Resource: props.outputBucket.arnForObjects('*'),
+            Condition: {
+              StringEquals: {
+                'AWS:SourceArn': `arn:aws:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
+              },
+            },
           },
-        },
-      }),
-    );
+        ],
+      },
+    });
 
     new cdk.CfnOutput(this, 'CloudFrontDomain', {
       value: `https://${this.distribution.distributionDomainName}`,

@@ -111,11 +111,6 @@ export class EcsStack extends cdk.Stack {
       ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
       ec2.Port.tcp(3001),
     );
-    // Allow API to reach RDS
-    props.database.dbSg.addIngressRule(apiSg, ec2.Port.tcp(5432));
-    // Allow API to reach Redis
-    props.cache.redisSg.addIngressRule(apiSg, ec2.Port.tcp(6379));
-
     // ALB listener → target group → API service
     const listener = this.alb.addListener('HttpListener', { port: 80 });
     listener.addTargets('ApiTarget', {
@@ -170,16 +165,6 @@ export class EcsStack extends cdk.Stack {
       ],
       adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
     });
-
-    // Allow worker to reach RDS + Redis
-    props.database.dbSg.addIngressRule(
-      workerService.connections.securityGroups[0],
-      ec2.Port.tcp(5432),
-    );
-    props.cache.redisSg.addIngressRule(
-      workerService.connections.securityGroups[0],
-      ec2.Port.tcp(6379),
-    );
 
     new cdk.CfnOutput(this, 'AlbDnsName', { value: this.alb.loadBalancerDnsName });
   }
